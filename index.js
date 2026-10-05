@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const {
   Client, GatewayIntentBits, Partials, Events, EmbedBuilder, ActionRowBuilder,
-  ButtonBuilder, ButtonStyle, PermissionFlagsBits: P, MessageFlags,
+  ButtonBuilder, ButtonStyle, PermissionFlagsBits: P, MessageFlags, REST, Routes,
 } = require('discord.js');
 
 /* ------------------------------ CONFIG ------------------------------ */
@@ -474,5 +474,4 @@ async function runQuestionnaire(user, dm) {
         embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle(`Question ${q + 1} of ${QUESTIONS.length}`)
           .setDescription(QUESTIONS[q]).setFooter({ text: 'Reply with your answer in this chat. Type "cancel" to stop.' })],
       });
-      const a = await askAnswer(dm, user);
-      if (a === null)
+      const a = await 
