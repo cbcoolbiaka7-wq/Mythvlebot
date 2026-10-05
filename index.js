@@ -406,21 +406,37 @@ async function editAppealMessage(a) {
   if (msg) await msg.edit(appealPayload(a));
 }
 
-async function ensureAppealMessage() {
+async function findPanels(ch) {
+  const msgs = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!msgs) return [];
+  return [...msgs.values()].filter((m) => m.author.id === client.user.id
+    && m.components.some((r) => r.components.some((c) => c.customId === 'appeal:start')));
+}
+
+async function postAppealPanel(replaceExisting) {
   const ch = await getChannel(CFG.appealMessageChannel);
-  if (!ch || !ch.isTextBased()) { console.warn('[APPEAL] Appeal message channel unavailable.'); return; }
-  if (D.config.appealMessageId) {
-    const m = await ch.messages.fetch(D.config.appealMessageId).catch(() => null);
-    if (m) return;
-  }
+  if (!ch || !ch.isTextBased()) throw new UserError('I cannot find or access the appeal channel.');
+  if (replaceExisting) for (const old of await findPanels(ch)) await old.delete().catch(() => {});
   const embed = new EmbedBuilder().setColor(COLORS.info).setTitle('Jail Appeals')
     .setDescription('If you want to appeal click on the link below and submit a forum the staff team will view your appeals as soon as possible');
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('appeal:start').setLabel('Start Appeal').setStyle(ButtonStyle.Primary),
   );
-  const msg = await ch.send({ embeds: [embed], components: [row] });
+  let msg;
+  try { msg = await ch.send({ embeds: [embed], components: [row] }); } catch (e) {
+    if (e.code === 50013 || e.code === 50001) throw new UserError(`I need View Channel, Send Messages and Embed Links in <#${ch.id}>.`);
+    throw e;
+  }
   D.config.appealMessageId = msg.id;
   await db.save();
+  return ch;
+}
+
+async function ensureAppealMessage() {
+  const ch = await getChannel(CFG.appealMessageChannel);
+  if (!ch || !ch.isTextBased()) { console.warn('[APPEAL] Appeal message channel unavailable.'); return; }
+  if ((await findPanels(ch)).length) return; // already posted
+  await postAppealPanel(false);
 }
 
 const TRASH = new Set([
@@ -710,6 +726,14 @@ function tempDelete(msg, ms = 5000) { if (msg) setTimeout(() => msg.delete().cat
 const auditReason = (ctx, r) => trunc(`${ctx.author.username}: ${r}`, 500);
 const activeWarnCount = (id) => D.warnings.filter((w) => w.userId === id && w.active).length;
 
+// Optional duration: "[duration] [reason]". No valid duration => permanent.
+function parseDurReason(rest) {
+  const [t, r] = splitFirst(rest);
+  const ms = parseDuration(t);
+  if (ms) return { ms, reason: r || 'No reason provided' };
+  return { ms: null, reason: (rest || '').trim() || 'No reason provided' };
+}
+
 // ---- warn / unwarn
 def('warn', { staff: true, async run(ctx) {
   const [tok, reason] = splitFirst(ctx.args);
@@ -741,23 +765,21 @@ def('unwarn', { staff: true, async run(ctx) {
 // ---- mute / unmute
 def('mute', { staff: true, perm: P.ModerateMembers, permName: 'Moderate Members', async run(ctx) {
   const [tok, rest] = splitFirst(ctx.args);
-  const [durTok, reason] = splitFirst(rest);
-  if (!tok || !durTok || !reason) throw usage('mute @user <duration> <reason>');
-  const ms = parseDuration(durTok);
-  if (!ms) throw new UserError('Invalid duration. Examples: `10s` `30s` `1m` `10m` `1h` `6h` `1d` `7d`.');
-  if (ms > MAX_TIMEOUT_MS) throw new UserError('The maximum mute duration is 28 days.');
+  if (!tok) throw usage('mute @user [duration] [reason]');
+  const { ms, reason } = parseDurReason(rest);
+  if (ms && ms > MAX_TIMEOUT_MS) throw new UserError('The maximum timed mute is 28 days. Leave the duration out for a permanent mute.');
   const { user, member } = await resolveTarget(ctx, tok);
   requireBotPerm(ctx, P.ModerateMembers, 'Moderate Members');
   if (!member.moderatable) throw new UserError('I cannot mute that user (role hierarchy or permissions).');
-  const durText = formatDuration(ms);
+  const durText = ms ? formatDuration(ms) : 'Permanent';
   const c = await newCase({ type: 'MUTE', targetId: user.id, modId: ctx.author.id, reason, duration: durText });
-  await member.timeout(ms, auditReason(ctx, reason));
-  D.mutes[user.id] = { caseId: c.id, expiresAt: now() + ms, modId: ctx.author.id, reason, active: true };
+  await member.timeout(ms || MAX_TIMEOUT_MS, auditReason(ctx, reason));
+  D.mutes[user.id] = { caseId: c.id, expiresAt: ms ? now() + ms : null, permanent: !ms, modId: ctx.author.id, reason, active: true };
   await db.save();
   const dm = await safeDM(user, { embeds: [dmEmbed(ctx.guild, { title: 'You have been muted', color: COLORS.mute, reason, duration: durText, caseId: c.id })] });
   await postLog(c, { title: 'User Muted', color: COLORS.mute, target: user, moderator: ctx.author, action: 'Mute', reason, duration: durText,
-    fields: [{ name: 'Expires', value: `<t:${unix(now() + ms)}:R>` }, { name: 'DM Delivered', value: dm ? 'Yes' : 'No' }] });
-  await success(ctx.message, `Muted <@${user.id}> for **${durText}**.`, c.id);
+    fields: [{ name: 'Expires', value: ms ? `<t:${unix(now() + ms)}:R>` : 'Never (permanent)' }, { name: 'DM Delivered', value: dm ? 'Yes' : 'No' }] });
+  await success(ctx.message, `Muted <@${user.id}> ${ms ? `for **${durText}**` : '**permanently**'}.`, c.id);
 } });
 
 def('unmute', { staff: true, perm: P.ModerateMembers, permName: 'Moderate Members', async run(ctx) {
@@ -894,11 +916,9 @@ def('unnick', { staff: true, perm: P.ManageNicknames, permName: 'Manage Nickname
 // ---- jail / unjail
 def('jail', { staff: true, perm: P.ManageRoles, permName: 'Manage Roles', async run(ctx) {
   const [tok, rest] = splitFirst(ctx.args);
-  const [durTok, reason] = splitFirst(rest);
-  if (!tok || !durTok || !reason) throw usage('jail @user <duration> <reason>');
-  const ms = parseDuration(durTok);
-  if (!ms) throw new UserError('Invalid duration. Examples: `30m` `1h` `1d` `7d`.');
-  if (ms > MAX_JAIL_MS) throw new UserError('The maximum jail duration is 365 days.');
+  if (!tok) throw usage('jail @user [duration] [reason]');
+  const { ms, reason } = parseDurReason(rest);
+  if (ms && ms > MAX_JAIL_MS) throw new UserError('The maximum timed jail is 365 days. Leave the duration out for a permanent jail.');
   const { user, member } = await resolveTarget(ctx, tok);
   requireBotPerm(ctx, P.ManageRoles, 'Manage Roles');
   const jailRole = ctx.guild.roles.cache.get(CFG.jailRole);
@@ -911,9 +931,9 @@ def('jail', { staff: true, perm: P.ManageRoles, permName: 'Manage Roles', async 
   const removable = all.filter((r) => !r.managed && r.position < botTop).map((r) => r.id);
   const keep = all.filter((r) => r.managed || r.position >= botTop).map((r) => r.id);
 
-  const durText = formatDuration(ms);
+  const durText = ms ? formatDuration(ms) : 'Permanent';
   const c = await newCase({ type: 'JAIL', targetId: user.id, modId: ctx.author.id, reason, duration: durText });
-  D.jails[user.id] = { active: true, caseId: c.id, roles: removable, jailedAt: now(), expiresAt: now() + ms, durationText: durText, reason, modId: ctx.author.id };
+  D.jails[user.id] = { active: true, caseId: c.id, roles: removable, jailedAt: now(), expiresAt: ms ? now() + ms : null, durationText: durText, reason, modId: ctx.author.id };
   await db.save();
   try {
     await member.roles.set([...keep, CFG.jailRole], auditReason(ctx, `Jailed: ${reason}`));
@@ -925,8 +945,8 @@ def('jail', { staff: true, perm: P.ManageRoles, permName: 'Manage Roles', async 
   const dm = await safeDM(user, { embeds: [dmEmbed(ctx.guild, { title: 'You have been jailed', color: COLORS.jail, reason, duration: durText, caseId: c.id,
     extra: [{ name: 'Appeal', value: `You may appeal in <#${CFG.appealMessageChannel}>.` }] })] });
   await postLog(c, { title: 'User Jailed', color: COLORS.jail, target: user, moderator: ctx.author, action: 'Jail', reason, duration: durText,
-    fields: [{ name: 'Expires', value: `<t:${unix(now() + ms)}:R>` }, { name: 'Roles Saved', value: String(removable.length) }, { name: 'DM Delivered', value: dm ? 'Yes' : 'No' }] });
-  await success(ctx.message, `Jailed <@${user.id}> for **${durText}**.`, c.id);
+    fields: [{ name: 'Expires', value: ms ? `<t:${unix(now() + ms)}:R>` : 'Never (permanent)' }, { name: 'Roles Saved', value: String(removable.length) }, { name: 'DM Delivered', value: dm ? 'Yes' : 'No' }] });
+  await success(ctx.message, `Jailed <@${user.id}> ${ms ? `for **${durText}**` : '**permanently**'}.`, c.id);
 } });
 
 def('unjail', { staff: true, perm: P.ManageRoles, permName: 'Manage Roles', async run(ctx) {
@@ -1123,19 +1143,25 @@ def('say', { staff: false, ephemeral: true, async run(ctx) {
     fields: [{ name: 'Channel', value: `<#${ctx.channel.id}>` }, { name: 'Message Length', value: `${text.length} characters` }] });
 } });
 
+// ---- appealpanel
+def('appealpanel', { staff: true, ephemeral: true, async run(ctx) {
+  const ch = await postAppealPanel(true);
+  await success(ctx.message, `Appeal panel posted in <#${ch.id}>.`);
+} });
+
 // ---- help
 def('help', { staff: false, async run(ctx) {
   const e = new EmbedBuilder().setColor(COLORS.info).setTitle('Commands').setDescription([
     '`warn @user <reason>` · `unwarn @user`',
-    '`mute @user <duration> <reason>` · `unmute @user`',
+    '`mute @user [duration] [reason]` · `unmute @user`',
     '`ban @user <reason>` · `unban <user ID>` · `kick @user <reason>`',
     '`strike @user <reason>` · `unstrike @user <number>`',
     '`nick @user <nickname>` · `unnick @user`',
-    '`jail @user <duration> <reason>` · `unjail @user`',
+    '`jail @user [duration] [reason]` · `unjail @user`',
     '`purge <amount>` · `purge human <amount>` · `clean [amount]`',
     '`lock` · `unlock` · `slowmode <seconds>`',
     '`snipe [1-150]` · `cs` · `dm @user <message>`',
-    '`afk <reason>` · `say <message>`',
+    '`afk <reason>` · `say <message>` · `appealpanel`',
     '',
     'All of these also work as slash commands.',
   ].map((l) => l.replaceAll('`', `\`${PREFIX}`).replace(/`,\s?·\s?`/g, '` · `')).join('\n'));
@@ -1181,7 +1207,7 @@ const REASON = ['reason', S, 'Reason', 1];
 const SLASH = [
   ['warn', 'Warn a user', [USER, REASON]],
   ['unwarn', 'Remove a user\'s most recent active warning', [USER]],
-  ['mute', 'Timeout a user', [USER, ['duration', S, 'Examples: 10s, 10m, 1h, 1d, 7d', 1], REASON]],
+  ['mute', 'Timeout a user (permanent if no duration)', [USER, ['duration', S, 'Examples: 10m, 1h, 1d. Leave empty for permanent', 0], ['reason', S, 'Reason', 0]]],
   ['unmute', 'Remove a user\'s timeout', [USER]],
   ['ban', 'Ban a user', [USER, REASON]],
   ['unban', 'Unban a user by ID', [['user_id', S, 'User ID to unban', 1]]],
@@ -1190,7 +1216,7 @@ const SLASH = [
   ['unstrike', 'Remove an active strike', [USER, ['number', I, 'Strike number (1 = oldest active)', 1, { min_value: 1 }]]],
   ['nick', 'Change a user\'s nickname', [USER, ['nickname', S, 'New nickname', 1, { max_length: 32 }]]],
   ['unnick', 'Reset a user\'s nickname', [USER]],
-  ['jail', 'Jail a user', [USER, ['duration', S, 'Examples: 30m, 1h, 1d, 7d', 1], REASON]],
+  ['jail', 'Jail a user (permanent if no duration)', [USER, ['duration', S, 'Examples: 30m, 1h, 1d. Leave empty for permanent', 0], ['reason', S, 'Reason', 0]]],
   ['unjail', 'Release a user from jail', [USER]],
   ['purge', 'Delete recent messages', [['amount', I, 'Number of messages', 1, { min_value: 1, max_value: 1000 }], ['human', B, 'Only delete messages from real users']]],
   ['clean', 'Delete recent bot messages', [['amount', I, 'Amount (default 50)', 0, { min_value: 1, max_value: 100 }]]],
@@ -1202,6 +1228,7 @@ const SLASH = [
   ['afk', 'Set your AFK status', [['reason', S, 'Reason', 0]]],
   ['dm', 'Send a DM to a user as staff', [USER, ['message', S, 'Message to send', 1]]],
   ['say', 'Make the bot send a message', [['message', S, 'Message', 1]]],
+  ['appealpanel', 'Post the jail appeal panel in the appeal channel'],
   ['help', 'List all commands'],
 ];
 
@@ -1262,7 +1289,7 @@ let ticking = false;
 
 async function expireJails(guild) {
   for (const [uid, j] of Object.entries(D.jails)) {
-    if (!j.active || j.expiresAt > now()) continue;
+    if (!j.active || !j.expiresAt || j.expiresAt > now()) continue;
     try {
       const res = await releaseJail(guild, uid, 'Jail duration expired');
       const user = await client.users.fetch(uid).catch(() => ({ id: uid, username: 'Unknown' }));
@@ -1282,9 +1309,19 @@ async function expireJails(guild) {
   }
 }
 
-async function expireMutes() {
+async function expireMutes(guild) {
   for (const [uid, m] of Object.entries(D.mutes)) {
-    if (!m.active || m.expiresAt > now()) continue;
+    if (!m.active) continue;
+    if (m.permanent) {
+      // Permanent mute: keep renewing Discord's 28-day timeout until unmuted.
+      const member = await guild.members.fetch(uid).catch(() => null);
+      if (!member) continue;
+      const until = member.communicationDisabledUntilTimestamp;
+      if (!until || until <= now()) { m.active = false; m.endedAt = now(); await db.save(); continue; } // removed manually
+      if (until - now() < 2 * 864e5) await member.timeout(MAX_TIMEOUT_MS, 'Permanent mute renewal').catch((e) => console.error('[TICK] Mute renewal failed:', e.message));
+      continue;
+    }
+    if (m.expiresAt > now()) continue;
     m.active = false;
     m.endedAt = now();
     await db.save();
@@ -1317,7 +1354,7 @@ async function tick() {
     const guild = await resolveGuild();
     if (!guild) return;
     await expireJails(guild);
-    await expireMutes();
+    await expireMutes(guild);
     await expireStrikes(guild);
   } catch (e) {
     console.error('[TICK] Error:', e);
@@ -1384,6 +1421,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
     if (MAIN_GUILD && member.guild.id !== MAIN_GUILD.id) return;
     if (D.jails[member.id]?.active) await member.roles.add(CFG.jailRole, 'Active jail re-applied on rejoin');
     else if (activeStrikes(member.id).length) await syncStrikeRoles(member);
+    const pm = D.mutes[member.id];
+    if (pm?.active && pm.permanent) await member.timeout(MAX_TIMEOUT_MS, 'Permanent mute re-applied on rejoin').catch(() => {});
   } catch (e) {
     console.error('[MEMBER] Rejoin handling failed:', e.message);
   }
