@@ -11,7 +11,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const {
   Client, GatewayIntentBits, Partials, Events, EmbedBuilder, ActionRowBuilder,
-  ButtonBuilder, ButtonStyle, PermissionFlagsBits: P, MessageFlags, REST, Routes,
+  ButtonBuilder, ButtonStyle, PermissionFlagsBits: P, MessageFlags, REST, Routes, StringSelectMenuBuilder,
 } = require('discord.js');
 
 /* ------------------------------ CONFIG ------------------------------ */
@@ -39,7 +39,7 @@ const CFG = {
 // Fun: the bot replies to every message from this user with the emoji below, 5 times.
 // Set REPLY_EMOJI_USER to '' to turn it off.
 const REPLY_EMOJI_USER = '1232671987386552464';
-const REPLY_EMOJI = 'ðŸ¥·ðŸ«„';
+const REPLY_EMOJI = '🥷🫄';
 
 const STRIKE_EXPIRY_MS = 5 * 7 * 24 * 60 * 60 * 1000; // 5 weeks
 const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000; // Discord limit
@@ -60,6 +60,69 @@ const QUESTIONS = [
 const COLORS = {
   warn: 0xf1c40f, mute: 0xe67e22, ban: 0xc0392b, kick: 0xd35400, jail: 0x8e44ad,
   strike: 0xe74c3c, good: 0x2ecc71, info: 0x3498db, neutral: 0x95a5a6, error: 0xe74c3c,
+};
+
+/* --------------------- PING ROLES & APPLICATIONS CONFIG -------------------- */
+// Everything below is easy to change later: channel IDs, role IDs, questions, cooldowns.
+
+const PING_CFG = {
+  channel: '1514570946696974436', // channel where the ping-role panel is posted
+  roles: [
+    { id: '1521576410010095616', label: 'QOTD', emoji: '⁉️', description: 'Question of the Day' },
+    { id: '1557749403614449674', label: 'Announcements & Information', emoji: '⚒️', description: 'Server announcements and important information' },
+    { id: '1557749621319798835', label: 'Giveaways', emoji: '🎉', description: 'Giveaway notifications' },
+    { id: '1557749787523158219', label: 'Dead Chat', emoji: '💀', description: 'Chat revival pings' },
+  ],
+};
+
+const APP_CFG = {
+  panelChannel: '1514544401156804648', // channel where the application panel is posted
+  defaultOpen: false, // used only until staff run /open applications or /close applications
+  cooldownMs: 24 * 60 * 60 * 1000, // minimum time between two submissions of the same application type
+  minAnswer: 10, // minimum answer length (characters)
+  confirmTimeoutMs: 10 * 60 * 1000, // time allowed to confirm the final submission
+  types: {
+    staff: {
+      label: 'Staff Application',
+      buttonLabel: 'Staff Application',
+      description: 'Help moderate the server and keep the community safe.',
+      color: 0x3498db,
+      // CHANGE THIS to the channel where completed Staff applications should be posted.
+      reviewChannel: CFG.appealReview,
+      questions: [
+        'How old are you, and what is your time zone?',
+        'How long have you been a member of this server, and what is your impression of the community?',
+        'Why do you want to become a staff member?',
+        'Do you have any previous moderation or staff experience? Describe it in detail.',
+        'How many hours per week can you realistically be active, and at what times of day?',
+        'A member keeps breaking the rules and argues with you when warned. How do you handle the situation?',
+        'Two staff members disagree about the correct punishment for a member. What do you do?',
+        'You notice a close friend breaking the rules. How do you respond?',
+        'What are your greatest strengths and weaknesses as a potential staff member?',
+        'Why should we choose you over other applicants? Add anything else we should know.',
+      ],
+    },
+    event: {
+      label: 'Event Conductor Application',
+      buttonLabel: 'Event Conductor Application',
+      description: 'Plan, host and run events for the community.',
+      color: 0x9b59b6,
+      // CHANGE THIS to the channel where completed Event Conductor applications should be posted.
+      reviewChannel: CFG.appealReview,
+      questions: [
+        'How old are you, and what is your time zone?',
+        'Why do you want to become an Event Conductor?',
+        'Do you have any previous experience hosting or organizing events? Describe it in detail.',
+        'List at least three event ideas you would host and explain why members would enjoy them.',
+        'Describe how you would run one of your events from start to finish, including preparation.',
+        'How would you handle cheating, rule-breaking or disputes between participants during an event?',
+        'How would you keep an event engaging when participation is low?',
+        'How many hours per week can you be active, and how often could you host events?',
+        'A technical problem or a mistake of yours disrupts a live event. What do you do?',
+        'Why should we choose you as an Event Conductor? Add anything else we should know.',
+      ],
+    },
+  },
 };
 
 /* ----------------------------- DATABASE ----------------------------- */
@@ -151,7 +214,7 @@ class UserError extends Error {}
 
 const now = () => Date.now();
 const unix = (ms) => Math.floor(ms / 1000);
-const trunc = (s, n) => { s = String(s ?? ''); return s.length > n ? `${s.slice(0, n - 1)}â€¦` : s; };
+const trunc = (s, n) => { s = String(s ?? ''); return s.length > n ? `${s.slice(0, n - 1)}…` : s; };
 const pad = (n) => String(n).padStart(4, '0');
 const NO_PING = { parse: [], repliedUser: false };
 const userName = (u) => u?.username ?? u?.tag ?? 'Unknown';
@@ -577,6 +640,7 @@ async function startAppeal(i) {
     return i.editReply('You already have a pending appeal. Please wait for staff to review it.');
   }
   if (sessions.has(user.id)) return i.editReply('You already have an appeal in progress. Check your direct messages.');
+  if (appSessions.has(user.id)) return i.editReply('You currently have an application in progress. Finish or cancel it before starting an appeal.');
   let dm;
   try {
     dm = await user.createDM();
@@ -1169,6 +1233,7 @@ def('help', { staff: false, async run(ctx) {
       { name: 'Strikes and Jail', value: fmt(['strike @user <reason>', 'unstrike @user <number>', 'jail @user [duration] [reason]', 'unjail @user', 'appealpanel']) },
       { name: 'Channel', value: fmt(['purge <amount>', 'purge human <amount>', 'clean [amount]', 'lock', 'unlock', 'slowmode <seconds>', 'snipe [1-150]', 'cs']) },
       { name: 'Other', value: fmt(['afk [reason]', 'dm @user <message>', 'say <message>', 'help']) },
+      { name: 'Pings and Applications (slash only)', value: '`/pings`\n`/open applications` (staff)\n`/close applications` (staff)' },
     );
   await ctx.message.reply({ embeds: [e], allowedMentions: NO_PING });
 } });
@@ -1238,10 +1303,10 @@ const SLASH = [
 ];
 
 function slashBody() {
-  return SLASH.map(([name, description, opts = []]) => ({
+  return [...SLASH.map(([name, description, opts = []]) => ({
     name, description,
     options: opts.map(([n, type, d, req, extra]) => ({ name: n, type, description: d, required: !!req, ...(extra || {}) })),
-  }));
+  })), ...EXTRA_SLASH];
 }
 
 async function registerSlashCommands() {
@@ -1250,7 +1315,7 @@ async function registerSlashCommands() {
   if (!guildId) { console.warn('[SLASH] GUILD_ID is not set and no guild was found; slash commands not registered.'); return; }
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: slashBody() });
-  console.log(`[SLASH] Registered ${SLASH.length} slash commands in guild ${guildId}.`);
+  console.log(`[SLASH] Registered ${SLASH.length + EXTRA_SLASH.length} slash commands in guild ${guildId}.`);
 }
 
 function slashArgs(i, slashDef) {
@@ -1286,6 +1351,346 @@ async function handleSlash(i) {
   };
   await execute(spec, i.commandName, fake, slashArgs(i, slashDef));
   if (!replied) await i.deleteReply().catch(() => {});
+}
+
+/* ---------------------------- PING ROLES ---------------------------- */
+
+const pingRoleIds = () => PING_CFG.roles.map((r) => r.id);
+
+function pingPanelPayload() {
+  const embed = new EmbedBuilder().setColor(COLORS.info).setTitle('Notification Preferences')
+    .setDescription([
+      'Choose the notifications you actually want to receive.',
+      "You will only be pinged for the categories you select, so you don't receive notifications you don't want.",
+      '',
+      'Click **Choose Your Pings** below to pick one, several or all categories. You can change your choice at any time, either with this button or with `/pings`.',
+    ].join('\n'))
+    .addFields({
+      name: 'Available Categories',
+      value: PING_CFG.roles.map((r) => `${r.emoji} **${r.label}** - ${r.description}`).join('\n'),
+    });
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('pings:open').setLabel('Choose Your Pings').setEmoji('🔔').setStyle(ButtonStyle.Primary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+function pingMenuPayload(member) {
+  const roles = PING_CFG.roles.filter((r) => member.guild.roles.cache.has(r.id));
+  if (!roles.length) throw new UserError('The ping roles are not set up correctly. Please contact staff.');
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('pings:select')
+    .setPlaceholder('Select the categories you want to be pinged for')
+    .setMinValues(0)
+    .setMaxValues(roles.length)
+    .addOptions(roles.map((r) => ({
+      label: r.label, value: r.id, description: r.description, emoji: r.emoji, default: member.roles.cache.has(r.id),
+    })));
+  const embed = new EmbedBuilder().setColor(COLORS.info).setTitle('Choose Your Pings')
+    .setDescription('Select every category you want to be notified about. Anything you leave unselected will be removed from you. Selecting nothing removes all ping roles.');
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral };
+}
+
+async function showPingMenu(i) {
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    const member = await i.guild.members.fetch(i.user.id);
+    const { flags, ...payload } = pingMenuPayload(member);
+    await i.editReply(payload);
+  } catch (e) {
+    if (!(e instanceof UserError)) console.error('[PINGS] Menu failed:', e);
+    await i.editReply({ content: e instanceof UserError ? e.message : 'I could not open the ping menu right now. Please try again later.', embeds: [], components: [] });
+  }
+}
+
+async function handlePingSelect(i) {
+  await i.deferUpdate();
+  const fail = (text) => i.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.error).setDescription(text)], components: [] });
+  try {
+    const member = await i.guild.members.fetch(i.user.id);
+    const valid = new Set(pingRoleIds());
+    const selected = new Set(i.values.filter((v) => valid.has(v)));
+    const known = PING_CFG.roles.filter((r) => i.guild.roles.cache.has(r.id));
+    const toAdd = known.filter((r) => selected.has(r.id) && !member.roles.cache.has(r.id));
+    const toRemove = known.filter((r) => !selected.has(r.id) && member.roles.cache.has(r.id));
+
+    const blocked = [...toAdd, ...toRemove].filter((r) => !i.guild.roles.cache.get(r.id).editable);
+    if (blocked.length) {
+      console.warn(`[PINGS] Cannot manage role(s): ${blocked.map((r) => r.id).join(', ')}. Check Manage Roles and role position.`);
+      return void await fail('I cannot manage one or more of these roles right now. Please contact staff.');
+    }
+    if (toAdd.length) await member.roles.add(toAdd.map((r) => r.id), 'Ping roles selected');
+    if (toRemove.length) await member.roles.remove(toRemove.map((r) => r.id), 'Ping roles deselected');
+
+    const list = (arr) => arr.map((r) => `${r.emoji} ${r.label}`).join('\n') || 'None';
+    const current = known.filter((r) => selected.has(r.id));
+    const e = new EmbedBuilder().setColor(COLORS.good).setTitle('Ping Preferences Updated')
+      .setDescription(toAdd.length || toRemove.length ? 'Your notification preferences have been saved.' : 'No changes were needed. Your preferences are already up to date.')
+      .addFields({ name: 'Your Ping Roles', value: list(current) });
+    if (toAdd.length) e.addFields({ name: 'Added', value: list(toAdd), inline: true });
+    if (toRemove.length) e.addFields({ name: 'Removed', value: list(toRemove), inline: true });
+    await i.editReply({ embeds: [e], components: [] });
+  } catch (e) {
+    console.error('[PINGS] Update failed:', e);
+    await fail(describeApiError(e));
+  }
+}
+
+/* ---------------------------- APPLICATIONS -------------------------- */
+
+const appSessions = new Map(); // userId -> { type } for applications in progress
+const NOW_OPEN = () => (D.config.applicationsOpen ?? APP_CFG.defaultOpen);
+
+function appStore() {
+  D.applications ??= {};
+  const a = D.applications;
+  a.submissions ??= {}; // APP-0001 -> submission
+  a.active ??= {};      // userId -> { type, startedAt } (applications currently being filled in)
+  a.lastSubmit ??= {};  // `${userId}:${type}` -> timestamp
+  return a;
+}
+
+function applicationPanelPayload() {
+  const open = NOW_OPEN();
+  const types = Object.entries(APP_CFG.types);
+  const embed = new EmbedBuilder().setColor(open ? COLORS.good : COLORS.error).setTitle('Applications')
+    .setDescription([
+      'Interested in contributing to the server? Select the position you want to apply for below.',
+      '',
+      `The application consists of **${types[0][1].questions.length} questions** and is completed in your direct messages with the bot. Please make sure your DMs are open, and answer every question honestly and in detail.`,
+    ].join('\n'))
+    .addFields(
+      { name: 'Positions', value: types.map(([, t]) => `**${t.label}** - ${t.description}`).join('\n') },
+      { name: 'Status', value: open ? '🟢 Applications are currently **open**.' : '🔴 Applications are currently **closed**.' },
+    );
+  const row = new ActionRowBuilder().addComponents(types.map(([key, t]) => new ButtonBuilder()
+    .setCustomId(`app:start:${key}`).setLabel(t.buttonLabel).setStyle(ButtonStyle.Primary).setDisabled(!open)));
+  return { embeds: [embed], components: [row] };
+}
+
+async function upsertPanel(channelId, marker, payload, name) {
+  const ch = await getChannel(channelId);
+  if (!ch || !ch.isTextBased()) { console.warn(`[PANEL] ${name} channel ${channelId} unavailable.`); return null; }
+  const msgs = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+  const existing = msgs && [...msgs.values()].find((m) => m.author.id === client.user.id
+    && m.components.some((r) => r.components.some((c) => c.customId === marker)));
+  try {
+    return existing ? await existing.edit(payload) : await ch.send(payload);
+  } catch (e) {
+    console.error(`[PANEL] Could not post ${name} panel: ${e.message} (need View Channel, Send Messages, Embed Links).`);
+    return null;
+  }
+}
+
+const refreshApplicationPanel = () => upsertPanel(APP_CFG.panelChannel, 'app:start:staff', applicationPanelPayload(), 'Application');
+
+async function setupPanels() {
+  for (const r of PING_CFG.roles) {
+    if (!MAIN_GUILD?.roles.cache.has(r.id)) console.warn(`[CONFIG] Ping role ${r.label} (${r.id}) was not found.`);
+  }
+  await upsertPanel(PING_CFG.channel, 'pings:open', pingPanelPayload(), 'Ping role');
+  await refreshApplicationPanel();
+}
+
+function closedEmbed() {
+  return new EmbedBuilder().setColor(COLORS.error).setTitle('Applications Closed')
+    .setDescription('Applications are currently **closed**. Please check back later; this panel will update when applications reopen.');
+}
+
+function buildApplicationEmbeds(sub) {
+  const type = APP_CFG.types[sub.type];
+  const unixTs = unix(sub.submittedAt);
+  const base = () => new EmbedBuilder().setColor(type.color).setTitle(trunc(`${type.label} - ${sub.id}`, 240)).setTimestamp(sub.submittedAt);
+  const embeds = [];
+  let cur = base().setDescription(`**Applicant:** <@${sub.userId}> (${trunc(sub.userName, 60)})`)
+    .addFields(
+      { name: 'Applicant', value: `<@${sub.userId}>`, inline: true },
+      { name: 'Discord ID', value: `\`${sub.userId}\``, inline: true },
+      { name: 'Application Type', value: type.label, inline: true },
+      { name: 'Submission Time', value: `<t:${unixTs}:F> (<t:${unixTs}:R>)` },
+    );
+  cur.setDescription(null);
+  if (sub.avatar) cur.setThumbnail(sub.avatar);
+  let size = 400;
+  sub.answers.forEach((a, n) => {
+    const name = trunc(`${n + 1}. ${type.questions[n]}`, 256);
+    const value = trunc(a, 1024);
+    if (size + name.length + value.length > 4800) { embeds.push(cur); cur = base(); size = 100; }
+    cur.addFields({ name, value });
+    size += name.length + value.length;
+  });
+  embeds.push(cur);
+  if (embeds.length > 1) embeds.forEach((e, n) => e.setFooter({ text: `Part ${n + 1} of ${embeds.length} | Applicant ID: ${sub.userId}` }));
+  else embeds[0].setFooter({ text: `Applicant ID: ${sub.userId}` });
+  return embeds;
+}
+
+async function startApplication(i, typeKey) {
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const type = APP_CFG.types[typeKey];
+  if (!type) return i.editReply('That application type no longer exists.');
+  if (!NOW_OPEN()) return i.editReply({ embeds: [closedEmbed()] });
+  const user = i.user;
+  const store = appStore();
+  if (appSessions.has(user.id) || store.active[user.id]) return i.editReply('You already have an application in progress. Check your direct messages, or type "cancel" there to stop it.');
+  if (sessions.has(user.id)) return i.editReply('You currently have a jail appeal in progress. Finish or cancel it before starting an application.');
+  const last = store.lastSubmit[`${user.id}:${typeKey}`];
+  if (last && now() - last < APP_CFG.cooldownMs) {
+    return i.editReply(`You have already submitted a ${type.label} recently. You can apply again <t:${unix(last + APP_CFG.cooldownMs)}:R>.`);
+  }
+  appSessions.set(user.id, { type: typeKey }); // reserve immediately so double clicks cannot start two sessions
+  let dm;
+  try {
+    dm = await user.createDM();
+    await dm.send({ embeds: [new EmbedBuilder().setColor(type.color).setTitle(type.label)
+      .setDescription(`You will be asked **${type.questions.length} questions**. Please answer each one seriously, honestly and in detail (at least ${APP_CFG.minAnswer} characters).\n\nType **cancel** at any time to stop. If you do not reply within 15 minutes, the application will time out.`)] });
+  } catch {
+    appSessions.delete(user.id);
+    return i.editReply('I could not send you a direct message. Enable DMs from server members and click the button again.');
+  }
+  store.active[user.id] = { type: typeKey, startedAt: now() };
+  await db.save();
+  await i.editReply('I have sent you a direct message to begin your application.');
+  runApplication(user, dm, typeKey).catch((e) => console.error('[APPLICATION]', e));
+}
+
+async function runApplication(user, dm, typeKey) {
+  const type = APP_CFG.types[typeKey];
+  const total = type.questions.length;
+  const answers = [];
+  try {
+    for (let q = 0; q < total; q++) {
+      await dm.send({ embeds: [new EmbedBuilder().setColor(type.color).setTitle(`${type.label} - Question ${q + 1} of ${total}`)
+        .setDescription(type.questions[q]).setFooter({ text: 'Reply with your answer in this chat. Type "cancel" to stop.' })] });
+      let a;
+      for (;;) {
+        a = await askAnswer(dm, user);
+        if (a === null || a === CANCEL) break;
+        if (a.length < APP_CFG.minAnswer) { await dm.send(`Please give a more detailed answer (at least ${APP_CFG.minAnswer} characters) and send it again.`); continue; }
+        break;
+      }
+      if (a === null) return void await dm.send('Your application timed out. Click the application button in the server to start again.');
+      if (a === CANCEL) return void await dm.send('Your application has been cancelled. Nothing was submitted.');
+      answers.push(a);
+    }
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('appdm:submit').setLabel('Submit Application').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('appdm:cancel').setLabel('Cancel').setStyle(ButtonStyle.Danger),
+    );
+    const prompt = await dm.send({
+      embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle('Ready to Submit')
+        .setDescription(`You have answered all ${total} questions. Submit your **${type.label}** now? You cannot edit it after submitting.`)],
+      components: [row],
+    });
+    let btn;
+    try {
+      btn = await prompt.awaitMessageComponent({ filter: (c) => c.user.id === user.id, time: APP_CFG.confirmTimeoutMs });
+    } catch {
+      await prompt.edit({ components: [] }).catch(() => {});
+      return void await dm.send('Your application timed out before it was submitted. Click the application button in the server to start again.');
+    }
+    if (btn.customId === 'appdm:cancel') {
+      await btn.update({ components: [] });
+      return void await dm.send('Your application has been cancelled. Nothing was submitted.');
+    }
+    await btn.update({ components: [] });
+    if (!appStore().active[user.id]) return; // session was invalidated
+
+    const sub = await submitApplication(user, typeKey, answers);
+    if (sub.delivered) {
+      await dm.send({ embeds: [new EmbedBuilder().setColor(COLORS.good).setTitle('Application Submitted')
+        .setDescription(`Your **${type.label}** has been submitted. Application ID: **${sub.id}**. The staff team will review it as soon as possible.`)] });
+    } else {
+      await dm.send('Your application was saved, but I could not deliver it to the review channel. Please contact a staff member and mention your application ID: **' + sub.id + '**.');
+    }
+  } catch (e) {
+    console.error('[APPLICATION] Error:', e);
+    await safeDM(user, 'An error occurred while processing your application. Please try again later.');
+  } finally {
+    appSessions.delete(user.id);
+    delete appStore().active[user.id];
+    await db.save();
+  }
+}
+
+async function submitApplication(user, typeKey, answers) {
+  const type = APP_CFG.types[typeKey];
+  const store = appStore();
+  D.counters.application = (D.counters.application || 0) + 1;
+  const sub = {
+    id: `APP-${pad(D.counters.application)}`, userId: user.id, userName: userName(user), avatar: user.displayAvatarURL(),
+    type: typeKey, answers, submittedAt: now(), delivered: false, reviewChannelId: type.reviewChannel, reviewMessageIds: [],
+  };
+  store.submissions[sub.id] = sub;
+  store.lastSubmit[`${user.id}:${typeKey}`] = sub.submittedAt;
+  await db.save();
+  try {
+    const ch = await getChannel(type.reviewChannel);
+    if (!ch || !ch.isTextBased()) throw new Error(`Review channel ${type.reviewChannel} unavailable.`);
+    for (const embed of buildApplicationEmbeds(sub)) {
+      const msg = await ch.send({ embeds: [embed], allowedMentions: NO_PING });
+      sub.reviewMessageIds.push(msg.id);
+    }
+    sub.delivered = true;
+  } catch (e) {
+    console.error(`[APPLICATION] Delivery of ${sub.id} failed:`, e.message);
+  }
+  await db.save();
+  return sub;
+}
+
+async function recoverApplications() {
+  const store = appStore();
+  const stale = Object.keys(store.active);
+  if (!stale.length) return;
+  store.active = {}; // sessions cannot survive a restart
+  await db.save();
+  for (const uid of stale) {
+    const user = await client.users.fetch(uid).catch(() => null);
+    if (user) await safeDM(user, { embeds: [new EmbedBuilder().setColor(COLORS.warn).setTitle('Application Interrupted')
+      .setDescription('The bot restarted while you were filling in your application, so it was cancelled and nothing was submitted. Please click the application button in the server to start again.')] });
+  }
+}
+
+/* ------------------------ NEW SLASH COMMANDS ------------------------ */
+
+const EXTRA_SLASH = [
+  { name: 'pings', description: 'Choose which ping roles you want to receive' },
+  { name: 'open', description: 'Open something for members', options: [{ type: 1, name: 'applications', description: 'Allow members to submit applications' }] },
+  { name: 'close', description: 'Close something for members', options: [{ type: 1, name: 'applications', description: 'Stop members from starting new applications' }] },
+];
+
+// Returns true if the interaction was one of the new commands.
+async function handleNewSlash(i) {
+  if (!EXTRA_SLASH.some((c) => c.name === i.commandName)) return false;
+  if (!i.guild || (MAIN_GUILD && i.guild.id !== MAIN_GUILD.id)) {
+    await i.reply({ content: 'This command can only be used in the server.', flags: MessageFlags.Ephemeral });
+    return true;
+  }
+  if (i.commandName === 'pings') { await showPingMenu(i); return true; }
+
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    const member = await i.guild.members.fetch(i.user.id);
+    if (!isStaff(member)) throw new UserError('This command is restricted to staff.');
+    if (i.options.getSubcommand() !== 'applications') throw new UserError('Unknown subcommand.');
+    const open = i.commandName === 'open';
+    if (NOW_OPEN() === open) throw new UserError(`Applications are already ${open ? 'open' : 'closed'}.`);
+    D.config.applicationsOpen = open;
+    D.config.applicationsChangedBy = i.user.id;
+    D.config.applicationsChangedAt = now();
+    await db.save();
+    await refreshApplicationPanel().catch((e) => console.error('[PANEL] Refresh failed:', e.message));
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(open ? COLORS.good : COLORS.error)
+      .setDescription(open ? 'Applications are now **open**. Members can submit applications.' : 'Applications are now **closed**. Members cannot start new applications. Applications already in progress may still be completed.')] });
+    await sendLog(CFG.mainLog, { embeds: [new EmbedBuilder().setColor(COLORS.neutral).setTitle(`Applications ${open ? 'Opened' : 'Closed'}`)
+      .addFields({ name: 'Staff Member', value: `<@${i.user.id}> (${userName(i.user)})` }).setTimestamp()], allowedMentions: NO_PING });
+  } catch (e) {
+    if (!(e instanceof UserError)) console.error('[APPLICATION] Toggle failed:', e);
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.error).setDescription(e instanceof UserError ? e.message : describeApiError(e))] }).catch(() => {});
+  }
+  return true;
 }
 
 /* ------------------------------ SCHEDULER --------------------------- */
@@ -1380,6 +1785,8 @@ client.once(Events.ClientReady, async (c) => {
     if (!exists && k !== 'appealCategory') console.warn(`[CONFIG] ${k} (${id}) was not found.`);
   }
   await ensureAppealMessage().catch((e) => console.error('[APPEAL] Panel setup failed:', e.message));
+  await setupPanels().catch((e) => console.error('[PANEL] Setup failed:', e.message));
+  await recoverApplications().catch((e) => console.error('[APPLICATION] Recovery failed:', e.message));
   await tick(); // recover anything that expired while offline
   setInterval(tick, TICK_MS);
 });
@@ -1438,9 +1845,15 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
 client.on(Events.InteractionCreate, async (i) => {
   try {
-    if (i.isChatInputCommand()) return await handleSlash(i);
+    if (i.isChatInputCommand()) return (await handleNewSlash(i)) || await handleSlash(i);
+    if (i.isStringSelectMenu()) {
+      if (i.customId === 'pings:select' && i.guild) return await handlePingSelect(i);
+      return;
+    }
     if (!i.isButton()) return;
     const id = i.customId;
+    if (id === 'pings:open' && i.guild) return await showPingMenu(i);
+    if (id.startsWith('app:start:') && i.guild) return await startApplication(i, id.split(':')[2]);
     if (id === 'appeal:start') return await startAppeal(i);
     if (id.startsWith('appealconfirm:')) return await handleConfirm(i, id.split(':')[1]);
     if (id.startsWith('appeal:accept:') || id.startsWith('appeal:deny:')) {
