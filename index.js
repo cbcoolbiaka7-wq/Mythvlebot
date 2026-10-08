@@ -77,6 +77,12 @@ const PING_CFG = {
 
 const APP_CFG = {
   panelChannel: '1514544401156804648', // channel where the application panel is posted
+  pendingChannel: '1516117756196425889', // pending applications (staff review with Accept / Deny buttons)
+  acceptedLog: '1516117830872076388', // log channel for accepted applications
+  deniedLog: '1516117867098275930', // log channel for denied applications
+  // Roles allowed to click Accept / Deny. Put your high-rank role ID(s) here.
+  // Channel visibility is also controlled by the pending channel's permissions.
+  reviewerRoles: [CFG.staffRole],
   defaultOpen: false, // used only until staff run /open applications or /close applications
   cooldownMs: 24 * 60 * 60 * 1000, // minimum time between two submissions of the same application type
   minAnswer: 10, // minimum answer length (characters)
@@ -87,8 +93,18 @@ const APP_CFG = {
       buttonLabel: 'Staff Application',
       description: 'Help moderate the server and keep the community safe.',
       color: 0x3498db,
-      // CHANGE THIS to the channel where completed Staff applications should be posted.
-      reviewChannel: CFG.appealReview,
+      roleId: '1514952787971145859', // role given when a Staff application is accepted
+      acceptedSteps: [
+        'Read the staff rules and guidelines carefully before you do anything else.',
+        'Contact a high-ranking staff member to begin your onboarding and training.',
+        'Do not use moderation tools or punish anyone until your training is complete.',
+        'Stay active and ask questions whenever you are unsure.',
+      ],
+      deniedSteps: [
+        'Review your answers and think about how you could give more detail next time.',
+        'Stay active and follow the rules to build trust with the community.',
+        'You are welcome to apply again whenever applications are open.',
+      ],
       questions: [
         'How old are you, and what is your time zone?',
         'How long have you been a member of this server, and what is your impression of the community?',
@@ -107,8 +123,18 @@ const APP_CFG = {
       buttonLabel: 'Event Conductor Application',
       description: 'Plan, host and run events for the community.',
       color: 0x9b59b6,
-      // CHANGE THIS to the channel where completed Event Conductor applications should be posted.
-      reviewChannel: CFG.appealReview,
+      roleId: '1522544958819794954', // role given when an Event Conductor application is accepted
+      acceptedSteps: [
+        'Read the event rules and guidelines before hosting anything.',
+        'Contact a high-ranking staff member to learn how events are approved and scheduled.',
+        'Plan your first event and get it approved before announcing it.',
+        'Ask for help or feedback after your first event so you can improve.',
+      ],
+      deniedSteps: [
+        'Review your answers and think about how you could give more detail next time.',
+        'Gain experience by taking part in and organizing small activities.',
+        'You are welcome to apply again whenever applications are open.',
+      ],
       questions: [
         'How old are you, and what is your time zone?',
         'Why do you want to become an Event Conductor?',
@@ -1488,6 +1514,12 @@ async function setupPanels() {
   for (const r of PING_CFG.roles) {
     if (!MAIN_GUILD?.roles.cache.has(r.id)) console.warn(`[CONFIG] Ping role ${r.label} (${r.id}) was not found.`);
   }
+  for (const [name, id] of [['pendingChannel', APP_CFG.pendingChannel], ['acceptedLog', APP_CFG.acceptedLog], ['deniedLog', APP_CFG.deniedLog]]) {
+    if (!(await getChannel(id))) console.warn(`[CONFIG] APP_CFG.${name} (${id}) was not found.`);
+  }
+  for (const t of Object.values(APP_CFG.types)) {
+    if (!MAIN_GUILD?.roles.cache.has(t.roleId)) console.warn(`[CONFIG] Role for ${t.label} (${t.roleId}) was not found.`);
+  }
   await upsertPanel(PING_CFG.channel, 'pings:open', pingPanelPayload(), 'Ping role');
   await refreshApplicationPanel();
 }
@@ -1620,16 +1652,19 @@ async function submitApplication(user, typeKey, answers) {
   D.counters.application = (D.counters.application || 0) + 1;
   const sub = {
     id: `APP-${pad(D.counters.application)}`, userId: user.id, userName: userName(user), avatar: user.displayAvatarURL(),
-    type: typeKey, answers, submittedAt: now(), delivered: false, reviewChannelId: type.reviewChannel, reviewMessageIds: [],
+    type: typeKey, answers, submittedAt: now(), delivered: false, status: 'pending', reviewChannelId: APP_CFG.pendingChannel, reviewMessageIds: [],
   };
   store.submissions[sub.id] = sub;
   store.lastSubmit[`${user.id}:${typeKey}`] = sub.submittedAt;
   await db.save();
   try {
-    const ch = await getChannel(type.reviewChannel);
-    if (!ch || !ch.isTextBased()) throw new Error(`Review channel ${type.reviewChannel} unavailable.`);
-    for (const embed of buildApplicationEmbeds(sub)) {
-      const msg = await ch.send({ embeds: [embed], allowedMentions: NO_PING });
+    const ch = await getChannel(APP_CFG.pendingChannel);
+    if (!ch || !ch.isTextBased()) throw new Error(`Pending channel ${APP_CFG.pendingChannel} unavailable.`);
+    const embeds = buildApplicationEmbeds(sub);
+    for (const [n, embed] of embeds.entries()) {
+      const payload = { embeds: [embed], allowedMentions: NO_PING };
+      if (n === embeds.length - 1) payload.components = [reviewRow(sub.id)]; // buttons sit under the last part
+      const msg = await ch.send(payload);
       sub.reviewMessageIds.push(msg.id);
     }
     sub.delivered = true;
@@ -1651,6 +1686,92 @@ async function recoverApplications() {
     if (user) await safeDM(user, { embeds: [new EmbedBuilder().setColor(COLORS.warn).setTitle('Application Interrupted')
       .setDescription('The bot restarted while you were filling in your application, so it was cancelled and nothing was submitted. Please click the application button in the server to start again.')] });
   }
+}
+
+/* ------------------------ APPLICATION REVIEW ------------------------ */
+
+const reviewRow = (appId) => new ActionRowBuilder().addComponents(
+  new ButtonBuilder().setCustomId(`appreview:accept:${appId}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+  new ButtonBuilder().setCustomId(`appreview:deny:${appId}`).setLabel('Deny').setStyle(ButtonStyle.Danger),
+);
+
+async function handleApplicationReview(i, action, appId) {
+  const reply = (content) => i.reply({ content, flags: MessageFlags.Ephemeral });
+  const reviewer = await i.guild.members.fetch(i.user.id).catch(() => null);
+  if (!reviewer || !APP_CFG.reviewerRoles.some((r) => reviewer.roles.cache.has(r))) {
+    return reply('You do not have permission to review applications.');
+  }
+  const store = appStore();
+  const sub = store.submissions[appId];
+  if (!sub) return reply('That application no longer exists.');
+  if ((sub.status ?? 'pending') !== 'pending') return reply(`This application was already handled (${sub.status}).`);
+  if (sub.userId === i.user.id) return reply('You cannot review your own application.');
+  const type = APP_CFG.types[sub.type];
+  if (!type) return reply('That application type no longer exists.');
+  const accepted = action === 'accept';
+
+  await i.deferUpdate();
+  if ((sub.status ?? 'pending') !== 'pending') return void i.followUp({ content: `This application was already handled (${sub.status}).`, flags: MessageFlags.Ephemeral });
+  sub.status = 'processing'; // lock against double clicks while roles are being applied
+
+  const fail = (text) => {
+    sub.status = 'pending';
+    return i.followUp({ content: text, flags: MessageFlags.Ephemeral });
+  };
+
+  if (accepted) {
+    try {
+      const role = i.guild.roles.cache.get(type.roleId);
+      if (!role) return void await fail('The role for this application type was not found. Check `roleId` in the configuration.');
+      if (!role.editable) return void await fail(`I cannot assign <@&${role.id}>. Make sure I have Manage Roles and my role is above it.`);
+      const applicant = await i.guild.members.fetch(sub.userId).catch(() => null);
+      if (!applicant) return void await fail('The applicant is no longer in the server, so the role could not be given. The application is still pending.');
+      await applicant.roles.add(role.id, `${type.label} ${sub.id} accepted by ${i.user.username}`);
+    } catch (e) {
+      console.error('[APPLICATION] Accept failed:', e);
+      return void await fail(`Could not accept the application: ${describeApiError(e)}`);
+    }
+  }
+
+  sub.status = accepted ? 'accepted' : 'denied';
+  sub.reviewedBy = i.user.id;
+  sub.reviewedAt = now();
+  await db.save();
+
+  const decided = unix(sub.reviewedAt);
+  const label = accepted ? 'Accepted' : 'Denied';
+  const color = accepted ? COLORS.good : COLORS.error;
+
+  // Update the pending message: remove buttons and show the decision.
+  try {
+    const embed = EmbedBuilder.from(i.message.embeds[i.message.embeds.length - 1]).setColor(color)
+      .addFields({ name: 'Decision', value: `**${label}** by <@${i.user.id}> on <t:${decided}:F>` });
+    await i.editReply({ embeds: [embed], components: [] });
+  } catch (e) { console.error('[APPLICATION] Could not update review message:', e.message); }
+
+  // Decision log.
+  const log = new EmbedBuilder().setColor(color).setTitle(`${type.label} ${label}`).setTimestamp(sub.reviewedAt)
+    .addFields(
+      { name: 'Applicant', value: `<@${sub.userId}> (${trunc(sub.userName, 60)})`, inline: true },
+      { name: 'Discord ID', value: `\`${sub.userId}\``, inline: true },
+      { name: 'Application ID', value: sub.id, inline: true },
+      { name: 'Application Type', value: type.label, inline: true },
+      { name: 'Reviewed By', value: `<@${i.user.id}> (${userName(i.user)})`, inline: true },
+      { name: 'Submitted', value: `<t:${unix(sub.submittedAt)}:F>`, inline: true },
+      { name: 'Decision Time', value: `<t:${decided}:F>`, inline: true },
+    );
+  if (accepted) log.addFields({ name: 'Role Granted', value: `<@&${type.roleId}>`, inline: true });
+  await sendLog(accepted ? APP_CFG.acceptedLog : APP_CFG.deniedLog, { embeds: [log], allowedMentions: NO_PING });
+
+  // Tell the applicant what happens next.
+  const dmOk = await safeDM(await client.users.fetch(sub.userId).catch(() => ({ send: async () => { throw new Error('no user'); } })), {
+    embeds: [new EmbedBuilder().setColor(color).setTitle(`${type.label} ${label}`)
+      .setDescription(accepted
+        ? `Congratulations! Your **${type.label}** (${sub.id}) has been **accepted** and you have been given the **${i.guild.roles.cache.get(type.roleId)?.name ?? 'new'}** role.\n\n**What to do next:**\n${type.acceptedSteps.map((s, n) => `${n + 1}. ${s}`).join('\n')}`
+        : `Thank you for applying. After review, your **${type.label}** (${sub.id}) was **not accepted** at this time.\n\n**What you can do next:**\n${type.deniedSteps.map((s, n) => `${n + 1}. ${s}`).join('\n')}`)
+      .setTimestamp()],
+  });
+  if (!dmOk) await i.followUp({ content: 'The decision was saved, but I could not DM the applicant (their DMs are closed).', flags: MessageFlags.Ephemeral }).catch(() => {});
 }
 
 /* ------------------------ NEW SLASH COMMANDS ------------------------ */
@@ -1746,157 +1867,4 @@ async function expireStrikes(guild) {
   const users = new Set();
   for (const s of expired) { s.active = false; s.removedAt = now(); s.removedReason = 'expired'; users.add(s.userId); }
   await db.save();
-  for (const uid of users) {
-    const member = await guild.members.fetch(uid).catch(() => null);
-    if (member) await syncStrikeRoles(member).catch((e) => console.error('[TICK] Strike role sync failed:', e.message));
-    const user = member?.user ?? await client.users.fetch(uid).catch(() => ({ id: uid, username: 'Unknown' }));
-    for (const s of expired.filter((x) => x.userId === uid)) {
-      await postLog(D.cases[s.caseId] || { id: s.caseId }, { title: 'Strike Expired', color: COLORS.good, target: user, moderator: client.user, action: 'Strike expiry (automatic)',
-        reason: `Strike ${s.id} expired after 5 weeks: ${s.reason}`, fields: [{ name: 'Remaining Active Strikes', value: String(activeStrikes(uid).length) }] });
-    }
-  }
-}
-
-async function tick() {
-  if (ticking) return;
-  ticking = true;
-  try {
-    const guild = await resolveGuild();
-    if (!guild) return;
-    await expireJails(guild);
-    await expireMutes(guild);
-    await expireStrikes(guild);
-  } catch (e) {
-    console.error('[TICK] Error:', e);
-  } finally {
-    ticking = false;
-  }
-}
-
-/* ------------------------------- EVENTS ----------------------------- */
-
-client.once(Events.ClientReady, async (c) => {
-  console.log(`[BOT] Logged in as ${c.user.tag}`);
-  await resolveGuild();
-  await registerSlashCommands().catch((e) => console.error('[SLASH] Registration failed:', e.message));
-  for (const [k, id] of Object.entries(CFG)) {
-    if (Array.isArray(id)) continue;
-    const exists = k.toLowerCase().includes('role') ? MAIN_GUILD?.roles.cache.has(id) : !!(await getChannel(id));
-    if (!exists && k !== 'appealCategory') console.warn(`[CONFIG] ${k} (${id}) was not found.`);
-  }
-  await ensureAppealMessage().catch((e) => console.error('[APPEAL] Panel setup failed:', e.message));
-  await setupPanels().catch((e) => console.error('[PANEL] Setup failed:', e.message));
-  await recoverApplications().catch((e) => console.error('[APPLICATION] Recovery failed:', e.message));
-  await tick(); // recover anything that expired while offline
-  setInterval(tick, TICK_MS);
-});
-
-client.on(Events.MessageCreate, async (message) => {
-  try {
-    if (message.author.bot || !message.guild) return;
-    if (MAIN_GUILD && message.guild.id !== MAIN_GUILD.id) return;
-    if (REPLY_EMOJI_USER && message.author.id === REPLY_EMOJI_USER) {
-      message.reply({ content: REPLY_EMOJI.repeat(5), allowedMentions: NO_PING }).catch(() => {});
-    }
-    if (D.afk[message.author.id] && !/^,afk(\s|$)/i.test(message.content)) {
-      const member = message.member ?? await message.guild.members.fetch(message.author.id).catch(() => null);
-      await clearAfk(message, member);
-    }
-    if (message.mentions.users.size) await notifyAfkMentions(message);
-    if (!message.content.startsWith(PREFIX)) return;
-    await handleCommand(message);
-  } catch (e) {
-    console.error('[MESSAGE] Handler error:', e);
-  }
-});
-
-client.on(Events.MessageDelete, (message) => {
-  try {
-    if (!message.guild || message.partial || message.author?.bot) return;
-    if (MAIN_GUILD && message.guild.id !== MAIN_GUILD.id) return;
-    if (ignoreDeleted.has(message.id)) return;
-    if (!message.content && !message.attachments.size && !message.stickers.size) return;
-    const entry = {
-      authorId: message.author.id, authorName: message.author.username, avatar: message.author.displayAvatarURL(),
-      content: message.content || '', channelId: message.channel.id, messageId: message.id, deletedAt: now(),
-      attachments: [...message.attachments.values()].map((a) => ({ name: a.name, url: a.url, contentType: a.contentType })),
-      stickers: [...message.stickers.values()].map((s) => s.name),
-    };
-    const list = snipes.get(message.channel.id) || [];
-    list.unshift(entry);
-    if (list.length > SNIPE_LIMIT) list.length = SNIPE_LIMIT;
-    snipes.set(message.channel.id, list);
-  } catch (e) {
-    console.error('[SNIPE] Error:', e);
-  }
-});
-
-client.on(Events.GuildMemberAdd, async (member) => {
-  try {
-    if (MAIN_GUILD && member.guild.id !== MAIN_GUILD.id) return;
-    if (D.jails[member.id]?.active) await member.roles.add(CFG.jailRole, 'Active jail re-applied on rejoin');
-    else if (activeStrikes(member.id).length) await syncStrikeRoles(member);
-    const pm = D.mutes[member.id];
-    if (pm?.active && pm.permanent) await member.timeout(MAX_TIMEOUT_MS, 'Permanent mute re-applied on rejoin').catch(() => {});
-  } catch (e) {
-    console.error('[MEMBER] Rejoin handling failed:', e.message);
-  }
-});
-
-client.on(Events.InteractionCreate, async (i) => {
-  try {
-    if (i.isChatInputCommand()) return (await handleNewSlash(i)) || await handleSlash(i);
-    if (i.isStringSelectMenu()) {
-      if (i.customId === 'pings:select' && i.guild) return await handlePingSelect(i);
-      return;
-    }
-    if (!i.isButton()) return;
-    const id = i.customId;
-    if (id === 'pings:open' && i.guild) return await showPingMenu(i);
-    if (id.startsWith('app:start:') && i.guild) return await startApplication(i, id.split(':')[2]);
-    if (id === 'appeal:start') return await startAppeal(i);
-    if (id.startsWith('appealconfirm:')) return await handleConfirm(i, id.split(':')[1]);
-    if (id.startsWith('appeal:accept:') || id.startsWith('appeal:deny:')) {
-      const [, action, appealId] = id.split(':');
-      if (!i.guild) return;
-      return await handleDecision(i, action, appealId);
-    }
-  } catch (e) {
-    if ([10062, 40060, 10008].includes(e?.code)) return; // expired / already acknowledged
-    console.error('[INTERACTION] Error:', e);
-    const payload = { content: 'Something went wrong while processing that button.', flags: MessageFlags.Ephemeral };
-    try {
-      if (i.deferred || i.replied) await i.followUp(payload);
-      else await i.reply(payload);
-    } catch { /* interaction expired */ }
-  }
-});
-
-client.on(Events.Error, (e) => console.error('[CLIENT] Error:', e));
-client.on(Events.Warn, (w) => console.warn('[CLIENT] Warn:', w));
-client.on(Events.ShardError, (e) => console.error('[SHARD] Error:', e));
-client.on(Events.ShardDisconnect, (ev, id) => console.warn(`[SHARD ${id}] Disconnected (${ev?.code}). Reconnecting...`));
-client.on(Events.ShardReconnecting, (id) => console.log(`[SHARD ${id}] Reconnecting...`));
-
-process.on('unhandledRejection', (e) => console.error('[PROCESS] Unhandled rejection:', e));
-process.on('uncaughtException', (e) => console.error('[PROCESS] Uncaught exception:', e));
-
-async function shutdown(sig) {
-  console.log(`[PROCESS] ${sig} received, saving data...`);
-  try { await db.save(); } catch { /* ignore */ }
-  try { await client.destroy(); } catch { /* ignore */ }
-  process.exit(0);
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-
-/* ------------------------------- START ------------------------------ */
-
-(async () => {
-  await db.load();
-  D = db.data;
-  await client.login(TOKEN);
-})().catch((e) => {
-  console.error('Fatal startup error:', e);
-  process.exit(1);
-});
+  
